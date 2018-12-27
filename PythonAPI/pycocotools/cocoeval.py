@@ -4,7 +4,7 @@ import numpy as np
 import datetime
 import time
 from collections import defaultdict
-from . import mask as maskUtils
+from pycocotools import mask as maskUtils
 import copy
 
 class COCOeval:
@@ -80,7 +80,7 @@ class COCOeval:
         if not cocoGt is None:
             self.params.imgIds = sorted(cocoGt.getImgIds())
             self.params.catIds = sorted(cocoGt.getCatIds())
-
+        pass
 
     def _prepare(self):
         '''
@@ -313,10 +313,10 @@ class COCOeval:
                 'dtIgnore':     dtIg,
             }
 
-    def accumulate(self, p = None):
+    def accumulate(self, config_params = None):
         '''
         Accumulate per image evaluation results and store the result in self.eval
-        :param p: input params for evaluation
+        :param config_params: input params for evaluation
         :return: None
         '''
         print('Accumulating evaluation results...')
@@ -324,94 +324,111 @@ class COCOeval:
         if not self.evalImgs:
             print('Please run evaluate() first')
         # allows input customized parameters
-        if p is None:
-            p = self.params
-        p.catIds = p.catIds if p.useCats == 1 else [-1]
-        T           = len(p.iouThrs)
-        R           = len(p.recThrs)
-        K           = len(p.catIds) if p.useCats else 1
-        A           = len(p.areaRng)
-        M           = len(p.maxDets)
-        precision   = -np.ones((T,R,K,A,M)) # -1 for the precision of absent categories
-        recall      = -np.ones((T,K,A,M))
-        scores      = -np.ones((T,R,K,A,M))
+        if config_params is None:
+            config_params = self.params
+        config_params.catIds = config_params.catIds if config_params.useCats == 1 else [-1]
+        num_iou_thresholds           = len(config_params.iouThrs)
+        num_confidence_thresholds           = len(config_params.recThrs)
+        num_categories           = len(config_params.catIds) if config_params.useCats else 1
+        num_areas           = len(config_params.areaRng)
+        num_max_det_variants           = len(config_params.maxDets)
+
+        precision   = -np.ones((num_iou_thresholds,num_confidence_thresholds,num_categories,num_areas,num_max_det_variants)) # -1 for the precision of absent categories
+        recall      = -np.ones((num_iou_thresholds,num_categories,num_areas,num_max_det_variants))
+        scores      = -np.ones((num_iou_thresholds,num_confidence_thresholds,num_categories,num_areas,num_max_det_variants))
 
         # create dictionary for future indexing
         _pe = self._paramsEval
         catIds = _pe.catIds if _pe.useCats else [-1]
-        setK = set(catIds)
-        setA = set(map(tuple, _pe.areaRng))
-        setM = set(_pe.maxDets)
-        setI = set(_pe.imgIds)
+        category_id_set = set(catIds)
+        area_range_set = set(map(tuple, _pe.areaRng))
+
+        max_det_variants_set = set(_pe.maxDets)
+
+        image_id_set = set(_pe.imgIds)
+
         # get inds to evaluate
-        k_list = [n for n, k in enumerate(p.catIds)  if k in setK]
-        m_list = [m for n, m in enumerate(p.maxDets) if m in setM]
-        a_list = [n for n, a in enumerate(map(lambda x: tuple(x), p.areaRng)) if a in setA]
-        i_list = [n for n, i in enumerate(p.imgIds)  if i in setI]
-        I0 = len(_pe.imgIds)
-        A0 = len(_pe.areaRng)
+        valid_category_index_list = [n for n, k in enumerate(config_params.catIds) if k in category_id_set]
+        valid_max_det_list = [m for n, m in enumerate(config_params.maxDets) if m in max_det_variants_set]
+
+        valid_area_range_indices_list = [n for n, a in enumerate(map(lambda x: tuple(x), config_params.areaRng)) if a in area_range_set]
+
+        valid_image_indices_list = [n for n, i in enumerate(config_params.imgIds) if i in image_id_set]
+
+        num_image_ids = len(_pe.imgIds)
+
+        num_area_ranges = len(_pe.areaRng)
+        #
         # retrieve E at each category, area range, and max number of detections
-        for k, k0 in enumerate(k_list):
-            Nk = k0*A0*I0
-            for a, a0 in enumerate(a_list):
-                Na = a0*I0
-                for m, maxDet in enumerate(m_list):
-                    E = [self.evalImgs[Nk + Na + i] for i in i_list]
-                    E = [e for e in E if not e is None]
-                    if len(E) == 0:
+        for cat_idx, category_index in enumerate(valid_category_index_list):
+            category_stat_offset = category_index*num_area_ranges*num_image_ids
+            for area_idx, area_range_index in enumerate(valid_area_range_indices_list):
+                area_range_offset = area_range_index*num_image_ids
+                for maxdet_idx, maxDet in enumerate(valid_max_det_list):
+                    image_evaluations_subset = [self.evalImgs[category_stat_offset + area_range_offset + i] for i in valid_image_indices_list]
+                    image_evaluations_subset = [e for e in image_evaluations_subset if not e is None]
+                    if len(image_evaluations_subset) == 0:
                         continue
-                    dtScores = np.concatenate([e['dtScores'][0:maxDet] for e in E])
+                    confidence_scores = np.concatenate([e['dtScores'][0:maxDet] for e in image_evaluations_subset])
 
                     # different sorting method generates slightly different results.
                     # mergesort is used to be consistent as Matlab implementation.
-                    inds = np.argsort(-dtScores, kind='mergesort')
-                    dtScoresSorted = dtScores[inds]
+                    inds = np.argsort(-confidence_scores, kind='mergesort')
+                    confidence_scores_sorted = confidence_scores[inds]
 
-                    dtm  = np.concatenate([e['dtMatches'][:,0:maxDet] for e in E], axis=1)[:,inds]
-                    dtIg = np.concatenate([e['dtIgnore'][:,0:maxDet]  for e in E], axis=1)[:,inds]
-                    gtIg = np.concatenate([e['gtIgnore'] for e in E])
-                    npig = np.count_nonzero(gtIg==0 )
-                    if npig == 0:
+                    prediction_matches_subset  = np.concatenate([e['dtMatches'][:,0:maxDet] for e in image_evaluations_subset], axis=1)[:,inds]
+
+                    ignored_predictions = np.concatenate([e['dtIgnore'][:,0:maxDet]  for e in image_evaluations_subset], axis=1)[:,inds]
+
+                    ignored_ground_truths = np.concatenate([e['gtIgnore'] for e in image_evaluations_subset])
+
+                    num_non_ignored_ground_truths = np.count_nonzero(ignored_ground_truths==0 )
+                    if num_non_ignored_ground_truths == 0:
                         continue
-                    tps = np.logical_and(               dtm,  np.logical_not(dtIg) )
-                    fps = np.logical_and(np.logical_not(dtm), np.logical_not(dtIg) )
+                    true_positive_indicators = np.logical_and(               prediction_matches_subset,  np.logical_not(ignored_predictions) )
+                    false_positive_indicators = np.logical_and(np.logical_not(prediction_matches_subset), np.logical_not(ignored_predictions) )
 
-                    tp_sum = np.cumsum(tps, axis=1).astype(dtype=np.float)
-                    fp_sum = np.cumsum(fps, axis=1).astype(dtype=np.float)
-                    for t, (tp, fp) in enumerate(zip(tp_sum, fp_sum)):
-                        tp = np.array(tp)
-                        fp = np.array(fp)
-                        nd = len(tp)
-                        rc = tp / npig
-                        pr = tp / (fp+tp+np.spacing(1))
-                        q  = np.zeros((R,))
-                        ss = np.zeros((R,))
+
+                    true_positive_sum = np.cumsum(true_positive_indicators, axis=1).astype(dtype=np.float)
+
+                    false_positive_sum = np.cumsum(false_positive_indicators, axis=1).astype(dtype=np.float)
+
+                    for t, (num_true_positives, num_false_positives) in enumerate(zip(true_positive_sum, false_positive_sum)):
+                        num_true_positives = np.array(num_true_positives)
+                        num_false_positives = np.array(num_false_positives)
+                        nd = len(num_true_positives)
+                        _recall = num_true_positives / num_non_ignored_ground_truths
+
+                        _precision = num_true_positives / (num_false_positives+num_true_positives+np.spacing(1))
+
+                        q  = np.zeros((num_confidence_thresholds,))
+                        ss = np.zeros((num_confidence_thresholds,))
 
                         if nd:
-                            recall[t,k,a,m] = rc[-1]
+                            recall[t,cat_idx,area_idx,maxdet_idx] = _recall[-1]
                         else:
-                            recall[t,k,a,m] = 0
+                            recall[t,cat_idx,area_idx,maxdet_idx] = 0
 
                         # numpy is slow without cython optimization for accessing elements
                         # use python array gets significant speed improvement
-                        pr = pr.tolist(); q = q.tolist()
+                        _precision = _precision.tolist(); q = q.tolist()
 
                         for i in range(nd-1, 0, -1):
-                            if pr[i] > pr[i-1]:
-                                pr[i-1] = pr[i]
+                            if _precision[i] > _precision[i-1]:
+                                _precision[i-1] = _precision[i]
 
-                        inds = np.searchsorted(rc, p.recThrs, side='left')
+                        inds = np.searchsorted(_recall, config_params.recThrs, side='left')
                         try:
                             for ri, pi in enumerate(inds):
-                                q[ri] = pr[pi]
-                                ss[ri] = dtScoresSorted[pi]
+                                q[ri] = _precision[pi]
+                                ss[ri] = confidence_scores_sorted[pi]
                         except:
                             pass
-                        precision[t,:,k,a,m] = np.array(q)
-                        scores[t,:,k,a,m] = np.array(ss)
+                        precision[t,:,cat_idx,area_idx,maxdet_idx] = np.array(q)
+                        scores[t,:,cat_idx,area_idx,maxdet_idx] = np.array(ss)
         self.eval = {
-            'params': p,
-            'counts': [T, R, K, A, M],
+            'params': config_params,
+            'counts': [num_iou_thresholds, num_confidence_thresholds, num_categories, num_areas, num_max_det_variants],
             'date': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'precision': precision,
             'recall':   recall,
@@ -532,3 +549,94 @@ class Params:
         self.iouType = iouType
         # useSegm is deprecated
         self.useSegm = None
+
+class ImageObjectAnnotations(object):
+
+    def __init__(self):
+        self.image_ids = set()
+        self.category_ids = set()
+        self.annotation_index = defaultdict(lambda : defaultdict(lambda : list()))
+        self.annotations = {}
+
+    def addImage(self, image_id):
+        """Add image id to dataset"""
+        self.image_ids.add(image_id)
+
+    def addCategoryId(self, category_id):
+        """Add category id to dataset"""
+        self.category_ids.add(category_id)
+
+    def addAnnotation(self, image_id, category_id, score, bbox):
+        """
+        Add single object annotation for a given image
+        :param image_id: image id to add annotation for
+        :param category_id: category id ( object class ) of object
+        :param score: prediction score ( between 0.0 and 1.0 )
+        :param bbox: Bounding box. Tuple or List of [ x, y, width, height ]
+        """
+        assert(image_id in self.image_ids)
+        assert (category_id in self.category_ids)
+        assert(len(bbox)==4)
+        annotation = {
+            "id" : len(self.annotations),
+            "ignore" : False,
+            "image_id" : image_id,
+            "iscrowd" : False,
+            "category_id" : category_id,
+            "score" : score,
+            "bbox" : bbox,
+            "area" : bbox[-1]*bbox[-2]
+        }
+        self.annotations[annotation["id"]] = annotation
+        self.annotation_index[image_id][category_id].append(annotation)
+
+    def loadAnns(self, ids):
+        """Load all annotations for given image ids"""
+        if ids is not None:
+            return [ self.annotations[id] for id in ids ]
+        else:
+            return list(self.annotations.values())
+
+    def getImgIds(self):
+        """Get all image ids"""
+        return sorted(list(self.image_ids))
+
+    def getCatIds(self):
+        """Get all category ids (class ids)"""
+        return sorted(list(self.category_ids))
+
+    def getAnnIds(self, imgIds, catIds):
+        """Get all annotation ids for given set of images and categories"""
+        result = []
+        for imi in imgIds:
+            for cati in catIds:
+                for ann in self.annotation_index[imi][cati]:
+                    result.append(ann['id'])
+        return result
+
+if __name__=='__main__':
+    gt = ImageObjectAnnotations()
+    pred = ImageObjectAnnotations()
+    for i in range(5):
+        gt.addCategoryId(i)
+        pred.addCategoryId(i)
+    for i in range(3):
+        gt.addImage(i)
+        pred.addImage(i)
+    gt.addAnnotation(1, 1, 1.0, [10.0, 10.0, 20.0, 20.0])
+    pred.addAnnotation(1, 1, 0.8, [9.0, 9.0, 22.0, 22.0])
+    gt.addAnnotation(2, 1, 1.0, [100.0, 10.0, 20.0, 20.0])
+    pred.addAnnotation(2, 1, 0.9, [95.0, 9.0, 22.0, 22.0])
+    try:
+        cceval = COCOeval(gt, pred, 'bbox' )
+        cceval.evaluate()
+        cceval.accumulate(None)
+        cceval.summarize()
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        import sys
+        sys.stderr.flush()
+        sys.stdout.flush()
+
+
